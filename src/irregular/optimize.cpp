@@ -908,17 +908,82 @@ void optimize_tree_search_relative_positions(
     tsrp_parameters.timer.add_end_boolean(&algorithm_formatter.end_boolean());
     if (parameters.optimization_mode == OptimizationMode::NotAnytimeSequential)
         tsrp_parameters.number_of_threads = 1;
-    TreeSearchRelativePositionsOutput tsrp_output = tree_search_relative_positions(
-            instance,
-            bin_type_id,
-            item_type_ids,
-            tsrp_parameters);
-    if (tsrp_output.status == TreeSearchRelativePositionsStatus::Infeasible) {
-        algorithm_formatter.update_is_proven_infeasible();
-    } else {
-        Solution solution(instance);
-        if (tree_search_relative_positions_solution(instance, bin_type_id, tsrp_output, solution))
-            algorithm_formatter.update_solution(solution, "TSRP");
+    if (instance.objective() != Objective::OpenDimensionX
+            && instance.objective() != Objective::OpenDimensionY) {
+        TreeSearchRelativePositionsOutput tsrp_output = tree_search_relative_positions(
+                instance,
+                bin_type_id,
+                item_type_ids,
+                tsrp_parameters);
+        if (tsrp_output.status == TreeSearchRelativePositionsStatus::Infeasible) {
+            algorithm_formatter.update_is_proven_infeasible();
+        } else {
+            Solution solution(instance);
+            if (tree_search_relative_positions_solution(instance, bin_type_id, tsrp_output, solution))
+                algorithm_formatter.update_solution(solution, "TSRP");
+        }
+        return;
+    }
+
+    // Open dimension objectives: the bound of a subset of the items is a
+    // bound for all of them, so the bounds of increasing subsets, the largest
+    // items first, are computed until the time limit. The pieces of the pairs
+    // of items are reused for the next subsets, through the cache.
+    bool open_dimension_x = (instance.objective() == Objective::OpenDimensionX);
+    TreeSearchRelativePositionsCache tsrp_cache;
+    tsrp_parameters.cache = &tsrp_cache;
+    std::stable_sort(
+            item_type_ids.begin(),
+            item_type_ids.end(),
+            [&instance](ItemTypeId item_type_id_1, ItemTypeId item_type_id_2)
+            {
+                return instance.item_type(item_type_id_1).space()
+                    > instance.item_type(item_type_id_2).space();
+            });
+    const AxisAlignedBoundingBox& bin_aabb = instance.bin_type(bin_type_id).aabb_orig;
+    LengthDbl open_start = (open_dimension_x)? bin_aabb.x_min: bin_aabb.y_min;
+    LengthDbl fixed_dimension = (open_dimension_x)?
+        bin_aabb.y_max - bin_aabb.y_min:
+        bin_aabb.x_max - bin_aabb.x_min;
+    LengthDbl bound = 0;
+    AreaDbl subset_area = 0;
+    for (ItemPos number_of_items = 1;
+            number_of_items <= (ItemPos)item_type_ids.size();
+            ++number_of_items) {
+        if (parameters.timer.needs_to_end() || algorithm_formatter.end_boolean())
+            return;
+        std::vector<ItemTypeId> subset(
+                item_type_ids.begin(),
+                item_type_ids.begin() + number_of_items);
+        subset_area += instance.item_type(subset.back()).space();
+        // The search stops if it finds a solution of the subset reaching its
+        // bound.
+        tsrp_parameters.open_dimension_lower_bound = (std::max)(
+                bound,
+                open_start + subset_area / fixed_dimension);
+        TreeSearchRelativePositionsOutput tsrp_output = tree_search_relative_positions(
+                instance,
+                bin_type_id,
+                subset,
+                tsrp_parameters);
+        if (tsrp_output.status == TreeSearchRelativePositionsStatus::Unknown)
+            return;
+        if (tsrp_output.status == TreeSearchRelativePositionsStatus::Infeasible) {
+            // The subset doesn't fit in the bin.
+            algorithm_formatter.update_is_proven_infeasible();
+            return;
+        }
+        bound = (std::max)(bound, tsrp_output.open_dimension_bound);
+        if (open_dimension_x) {
+            algorithm_formatter.update_open_dimension_x_bound(bound);
+        } else {
+            algorithm_formatter.update_open_dimension_y_bound(bound);
+        }
+        if (number_of_items == (ItemPos)item_type_ids.size()) {
+            Solution solution(instance);
+            if (tree_search_relative_positions_solution(instance, bin_type_id, tsrp_output, solution))
+                algorithm_formatter.update_solution(solution, "TSRP");
+        }
     }
 }
 
@@ -1120,12 +1185,6 @@ packingsolver::irregular::Output packingsolver::irregular::optimize(
     bool use_milp_raster = parameters.use_milp_raster;
     bool use_benders_decomposition = parameters.use_benders_decomposition;
     bool use_tree_search_relative_positions = parameters.use_tree_search_relative_positions;
-    // The tree search on relative positions only supports the 'Feasibility'
-    // objective with a single bin.
-    if (instance.objective() != Objective::Feasibility
-            || instance.number_of_bins() != 1) {
-        use_tree_search_relative_positions = false;
-    }
     // Benders decomposition only supports these objectives.
     if (instance.objective() != Objective::Knapsack
             && instance.objective() != Objective::BinPacking
@@ -1145,6 +1204,11 @@ packingsolver::irregular::Output packingsolver::irregular::optimize(
         if (instance.objective() == Objective::Knapsack) {
             use_local_search_linear_programming = false;
             use_local_search_nonlinear_programming = false;
+        }
+        if (instance.objective() != Objective::Feasibility
+                && instance.objective() != Objective::OpenDimensionX
+                && instance.objective() != Objective::OpenDimensionY) {
+            use_tree_search_relative_positions = false;
         }
         // Automatic selection.
         if (!use_tree_search
@@ -1193,8 +1257,10 @@ packingsolver::irregular::Output packingsolver::irregular::optimize(
             if (parameters.optimization_mode == OptimizationMode::Exact) {
                 if (instance.objective() == Objective::Knapsack)
                     use_benders_decomposition = true;
-                if (instance.objective() == Objective::Feasibility
-                        && instance.number_of_bins() == 1) {
+                if ((instance.objective() == Objective::Feasibility
+                            && instance.number_of_bins() == 1)
+                        || instance.objective() == Objective::OpenDimensionX
+                        || instance.objective() == Objective::OpenDimensionY) {
                     use_tree_search_relative_positions = true;
                 }
             }
@@ -1205,6 +1271,7 @@ packingsolver::irregular::Output packingsolver::irregular::optimize(
         use_local_search_nonlinear_programming = false;
         use_dichotomic_search = false;
         use_tree_search_periodic_packing = false;
+        use_tree_search_relative_positions = false;
         // Automatic selection.
         if (!use_tree_search
                 && !use_local_search_direct_trigonometry
@@ -1235,6 +1302,7 @@ packingsolver::irregular::Output packingsolver::irregular::optimize(
         use_local_search_nonlinear_programming = false;
         use_dichotomic_search = false;
         use_tree_search_periodic_packing = false;
+        use_tree_search_relative_positions = false;
         // Automatic selection.
         if (!use_tree_search
                 && !use_benders_decomposition
@@ -1278,6 +1346,7 @@ packingsolver::irregular::Output packingsolver::irregular::optimize(
         }
         use_dichotomic_search = false;
         use_milp_raster = false;
+        use_tree_search_relative_positions = false;
         // Automatic selection.
         if (!use_tree_search
                 && !use_benders_decomposition
@@ -1322,6 +1391,7 @@ packingsolver::irregular::Output packingsolver::irregular::optimize(
         use_local_search_direct_trigonometry = false;
         use_local_search_black_box_optimization = false;
         use_tree_search_periodic_packing = false;
+        use_tree_search_relative_positions = false;
         if (instance.number_of_bin_types() == 1) {
             if (use_dichotomic_search) {
                 use_dichotomic_search = false;

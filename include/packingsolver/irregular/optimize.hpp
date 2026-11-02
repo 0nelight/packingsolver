@@ -282,8 +282,8 @@ struct OptimizeParameters: packingsolver::Parameters<Instance, Solution, Output>
 
     /**
      * Use the tree search on relative positions (only for the 'Feasibility'
-     * objective with a single bin; only selected automatically in 'Exact'
-     * mode).
+     * objective with a single bin, and for the open dimension objectives;
+     * only selected automatically in 'Exact' mode).
      */
     bool use_tree_search_relative_positions = false;
 
